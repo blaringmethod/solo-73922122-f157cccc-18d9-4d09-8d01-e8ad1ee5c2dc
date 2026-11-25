@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% block title %}连续价取数{% endblock %}
+{% block title %}连续价与区间回落查询{% endblock %}
 {% block content %}
 <h2>连续价取数</h2>
 <p class="hint">选择日期范围与基准日（<strong>基准日不得早于结束日</strong>）。
@@ -37,5 +37,118 @@
   {% endfor %}
   </tbody>
 </table>
+{% endif %}
+
+<hr class="sep" id="drawdown">
+
+<h2>区间最大回落查询</h2>
+<p class="hint">研究员选起止日，查其中<strong>哪两天之间累计下跌最多</strong>。
+相邻交易日的涨跌，一律用<strong>后一日在用合约</strong>的两笔结算价计算（后日价 − 前日同合约价）；
+换月时即使旧合约缺价，换月边仍按此规则计算。任意两日的回落 = 其间逐日涨跌之和；
+任一所需报价缺失，该相邻两日即断开，累计<strong>不能跨过断点</strong>。
+同额时先取较早的起日，再取较早的止日。核算走线段树索引：区间查询与单笔补改均只读写
+O(log 交易日数) 条索引记录；整次查询只读同一已提交状态。</p>
+
+<div class="demo-panel">
+  <div class="demo-head">
+    <strong>网页演示：换月与「补价前 → 补价后」的回落变化</strong>
+    <span class="hint">一键载入内置小场景（会清空当前全部数据，仅供演示）</span>
+  </div>
+  <div class="demo-actions">
+    <form method="post" action="{{ url_for('demo_seed') }}"
+          onsubmit="return confirm('载入演示场景会清空当前日历/计划/报价，确定继续？');">
+      <button type="submit">① 载入演示（补价前）</button>
+    </form>
+    <form method="post" action="{{ url_for('demo_fill') }}">
+      <button type="submit" class="primary">② 补入 {{ demo_const.FILL_CONTRACT_CODE }}
+        {{ demo_const.FILL_DATE }} = {{ demo_const.FILL_PRICE }} 分，再查回落</button>
+    </form>
+    <form method="post" action="{{ url_for('demo_unfill') }}">
+      <button type="submit">撤销补价（回到补价前）</button>
+    </form>
+  </div>
+  {% if demo_mode == 'before' %}
+  <p class="demo-note">当前为<strong>补价前</strong>：{{ demo_const.FILL_CONTRACT_CODE }}
+    在 {{ demo_const.FILL_DATE }} 缺价，相邻两条边断开；另有换月参考日旧合约
+    {{ demo_const.INITIAL_CODE }}@2026-03-04 缺价，但换月边
+    03-04→03-05 用新合约两笔价仍可计算。预期最大回落
+    {{ demo_const.BEFORE_EXPECTED.amount }} 分
+    （{{ demo_const.BEFORE_EXPECTED.start }} → {{ demo_const.BEFORE_EXPECTED.end }}）。
+    点②补价后应变为 {{ demo_const.AFTER_EXPECTED.amount }} 分
+    （{{ demo_const.AFTER_EXPECTED.start }} → {{ demo_const.AFTER_EXPECTED.end }}）。</p>
+  {% elif demo_mode == 'after' %}
+  <p class="demo-note ok-note">当前为<strong>补价后</strong>：断点修复，可跨原断点累计，
+    预期最大回落 {{ demo_const.AFTER_EXPECTED.amount }} 分
+    （{{ demo_const.AFTER_EXPECTED.start }} → {{ demo_const.AFTER_EXPECTED.end }}）。
+    页面顶部提示条给出了补价前后对照。</p>
+  {% endif %}
+</div>
+
+<form method="get" action="{{ url_for('query_view') }}" class="grid-form dd-form">
+  <label>回落起日 <input type="date" name="dd_start" value="{{ dd_start }}" required></label>
+  <label>回落止日 <input type="date" name="dd_end" value="{{ dd_end }}" required></label>
+  <button type="submit" class="primary">查询最大回落</button>
+  {% if dd_submitted and not dd_err and dd_start and dd_end %}
+  <a class="button ghost" href="{{ url_for('api_drawdown', start=dd_start, end=dd_end) }}"
+     target="_blank">JSON 接口</a>
+  {% endif %}
+</form>
+
+{% if dd_err %}<div class="flash err">{{ dd_err }}</div>{% endif %}
+
+{% if dd_submitted and dd and not dd_err %}
+  {% if dd.found %}
+  <div class="dd-hero">
+    <div class="dd-amount">
+      <span class="dd-num">{{ dd.amount }}</span><span class="dd-unit">分</span>
+      <small>最大累计回落（整数分）</small>
+    </div>
+    <div class="dd-dates">
+      <div><span>起日</span><strong>{{ dd.start }}</strong></div>
+      <div class="dd-arrow">────────▶</div>
+      <div><span>止日</span><strong>{{ dd.end }}</strong></div>
+    </div>
+    <div class="dd-meta hint">窗口 {{ dd_start }} ~ {{ dd_end }} 内共
+      {{ dd.window_days }} 个交易日；该区间累计涨跌 {{ dd.sum }} 分（负=下跌）。
+      下表高亮行为构成最大回落的逐日边。</div>
+  </div>
+  {% else %}
+  <div class="flash err dd-none">{{ dd.message }}</div>
+  {% endif %}
+
+  {% if dd.edges is not none and dd.edges %}
+  <h3 class="edge-title">逐日涨跌核对（后一日在用合约两笔结算价，后日−前日）</h3>
+  <table class="edge-table">
+    <thead><tr>
+      <th>前日</th><th>后日</th><th>后日在用合约</th>
+      <th>前日结算价(分)</th><th>后日结算价(分)</th><th>涨跌(分)</th>
+      <th>核算状态</th>
+    </tr></thead>
+    <tbody>
+    {% for e in dd.edges %}
+      <tr class="{{ 'best' if e.in_best else ('warn' if not e.valid else '') }}">
+        <td>{{ e.prev_date }}</td>
+        <td>{{ e.next_date }}</td>
+        <td>{{ e.contract }}
+          {% if e.is_roll_edge %}<span class="badge roll">换月边</span>{% endif %}
+          {% if e.in_best %}<span class="badge best">最大回落段</span>{% endif %}
+        </td>
+        <td>{{ e.prev_price if e.prev_price is not none else '—' }}</td>
+        <td>{{ e.next_price if e.next_price is not none else '—' }}</td>
+        <td class="{{ 'down' if e.change is not none and e.change < 0 else ('up' if e.change is not none and e.change > 0 else '') }}">
+          {% if e.change is none %}—{% else %}{{ '%+d'|format(e.change) }}{% endif %}
+        </td>
+        <td>
+          {% if e.valid %}
+            可核算
+          {% else %}
+            <strong>断点：</strong>缺少 {{ e.missing }}，累计不得跨过
+          {% endif %}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
 {% endif %}
 {% endblock %}

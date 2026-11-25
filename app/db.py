@@ -101,11 +101,16 @@ def snapshot(conn: sqlite3.Connection):
     """
     只读快照事务：整次取数只看到同一个已提交状态。
     SQLite 默认 DEFERRED 事务的首条 SELECT 即获取读快照，事务结束前不变。
+    若事务内顺带做了幂等的回落索引补建（派生数据），正常结束一并提交；
+    任何异常都整体回滚，绝不留下半建索引。
     """
     conn.execute("BEGIN")
     try:
         yield conn
-    finally:
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    else:
         conn.execute("COMMIT")
 
 
@@ -138,6 +143,8 @@ def replace_calendar(conn: sqlite3.Connection, dates: list[str]) -> int:
     with write_tx(conn):
         conn.execute("DELETE FROM calendar")
         conn.executemany("INSERT INTO calendar(date) VALUES (?)", [(d,) for d in cleaned])
+        # 日历变了：回落索引按新配置全量重建（允许的例外路径），与日历同事务生效
+        _rebuild_drawdown_index_locked(conn)
     return len(cleaned)
 
 
@@ -242,6 +249,8 @@ def setup_plan(conn: sqlite3.Connection, initial_code: str,
                 "VALUES (?, ?, ?, ?, NULL)",
                 (k, sd, pre, new_id),
             )
+        # 计划变了：在用合约归属可能全变，按新计划全量重建回落索引
+        _rebuild_drawdown_index_locked(conn)
 
 
 # --------------------------------------------------------------------------- #
@@ -369,6 +378,8 @@ def upsert_price(conn: sqlite3.Connection, contract_id: int, day: str,
 
     try:
         with write_tx(conn):
+            # 必须在本事务写 prices（会经触发器推高 rev）之前读取索引版本状态
+            dd_state_pre = _dd_state_row(conn)
             conn.execute(
                 "INSERT INTO prices(contract_id, date, price) VALUES (?, ?, ?) "
                 "ON CONFLICT(contract_id, date) DO UPDATE SET price = excluded.price",
@@ -377,7 +388,9 @@ def upsert_price(conn: sqlite3.Connection, contract_id: int, day: str,
             if affected_roll is not None:
                 new_delta = _recompute_roll_delta(conn, affected_roll["ord"])
                 preview["new_delta"] = new_delta
-        # 事务已由上下文管理器提交：原价与受影响价差同时生效
+            # 报价 + 换月价差 + 回落索引在同一事务生效；失败整体回滚，照旧索引供数
+            _sync_drawdown_after_price_write(conn, dd_state_pre, contract_id, day)
+        # 事务已由上下文管理器提交：原价、价差与回落索引同时生效
         preview["committed"] = True
     except sqlite3.Error as e:
         # 保存失败已整体回滚；预期结果仍随 preview 返回供页面展示
@@ -515,6 +528,523 @@ def to_csv(rows: list[dict]) -> str:
             r["message"],
         ])
     return buf.getvalue()
+
+
+# --------------------------------------------------------------------------- #
+# 区间最大回落：相邻交易日边权 + 线段树索引
+#
+# 口径（与连续价的换月价差调整是两套独立算法）
+# ------------------------------------------------
+# 日历排序为 d_0..d_{n-1}。边 li 连接 d_li -> d_li+1，取“后一日在用合约” c：
+#   w_li = price(c, d_li+1) - price(c, d_li)
+# 两笔报价任一缺失，该边即为断点；任意两日 d_a -> d_b 的累计涨跌 =
+# Σ_{li=a..b-1} w_li，且区间内不能含断点。最大回落 = 最小累计和的相反数。
+# 同额裁决：较早的起日，再较早的止日（候选键 (和, a, b) 取最小）。
+#
+# 复杂度
+# ------
+# dd_node 是堆式线段树（叶编号 size+li）。区间查询只按键取 O(log n) 个节点；
+# 一笔报价至多影响相邻两条边，每条边自叶向根改写 O(log n) 个节点。
+# 日历/计划大改或检测到库外直接改价（rev 不一致）时允许全量重建；
+# 旧库首次访问时 built_rev=-1，也走同一补建路径。
+# --------------------------------------------------------------------------- #
+
+class _Seg:
+    """线段树节点摘要。候选统一为 (和, 起日全局下标, 止日全局下标)。"""
+
+    __slots__ = ("cnt", "tot", "pref", "suff", "best")
+
+    def __init__(self, cnt: int = 0, tot: Optional[int] = 0,
+                 pref=None, suff=None, best=None):
+        self.cnt = cnt        # 真实边数；0 表示补齐用的空段（合并单位元）
+        self.tot = tot        # 整段和；非空段含断点时为 None
+        self.pref = pref      # 最小和前缀候选（非空、不跨断点）
+        self.suff = suff      # 最小和后缀候选
+        self.best = best      # 最小和连续子段候选（即最大回落对应段）
+
+
+def _better(c1, c2):
+    """候选键 (和, 起日, 止日) 最小者：同额先早起日、再早止日。"""
+    if c1 is None:
+        return c2
+    if c2 is None:
+        return c1
+    return c1 if (c1[0], c1[1], c1[2]) <= (c2[0], c2[1], c2[2]) else c2
+
+
+def _merge_seg(a: _Seg, b: _Seg) -> _Seg:
+    """左段 a 与右段 b 顺序拼接（运算满足结合律，空段为单位元）。"""
+    if a.cnt == 0:
+        return b
+    if b.cnt == 0:
+        return a
+    cnt = a.cnt + b.cnt
+    tot = None if (a.tot is None or b.tot is None) else a.tot + b.tot
+
+    pref = a.pref
+    # 横跨“整个 a + b 的最小前缀”的前缀；a.tot 非 None 才可能不跨断点
+    if a.tot is not None and b.pref is not None:
+        crossing = (a.tot + b.pref[0], a.pref[1], b.pref[2])
+        pref = _better(pref, crossing)
+
+    suff = b.suff
+    if b.tot is not None and a.suff is not None:
+        crossing = (a.suff[0] + b.tot, a.suff[1], b.suff[2])
+        suff = _better(suff, crossing)
+
+    best = _better(a.best, b.best)
+    if a.suff is not None and b.pref is not None:
+        crossing = (a.suff[0] + b.pref[0], a.suff[1], b.pref[2])
+        best = _better(best, crossing)
+
+    return _Seg(cnt, tot, pref, suff, best)
+
+
+def _leaf_seg(li: int, w: int) -> _Seg:
+    cand = (w, li, li + 1)
+    return _Seg(1, w, cand, cand, cand)
+
+
+def _broken_leaf_seg() -> _Seg:
+    # cnt=1 与“补齐空段 cnt=0”区分；tot/候选全空即断点
+    return _Seg(1, None, None, None, None)
+
+
+def _dd_state_row(conn: sqlite3.Connection) -> Optional[sqlite3.Row]:
+    return conn.execute("SELECT * FROM dd_state WHERE id = 1").fetchone()
+
+
+def _row_to_seg(r: Optional[sqlite3.Row]) -> _Seg:
+    if r is None:
+        return _Seg()
+
+    def cand(kind: str):
+        v = r[f"{kind}_sum"]
+        if v is None:
+            return None
+        return (v, r[f"{kind}_a"], r[f"{kind}_b"])
+
+    return _Seg(r["cnt"], r["tot"], cand("pref"), cand("suff"), cand("best"))
+
+
+def _dd_load_seg(conn: sqlite3.Connection, node: int) -> _Seg:
+    """按键读取单个线段树节点记录（复杂度计数的基本读单位）。"""
+    r = conn.execute("SELECT * FROM dd_node WHERE node = ?", (node,)).fetchone()
+    return _row_to_seg(r)
+
+
+_DD_UPSERT_SQL = (
+    "INSERT INTO dd_node(node, cnt, tot, pref_sum, pref_a, pref_b, "
+    "                    suff_sum, suff_a, suff_b, best_sum, best_a, best_b) "
+    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?) "
+    "ON CONFLICT(node) DO UPDATE SET "
+    "  cnt=excluded.cnt, tot=excluded.tot, "
+    "  pref_sum=excluded.pref_sum, pref_a=excluded.pref_a, pref_b=excluded.pref_b, "
+    "  suff_sum=excluded.suff_sum, suff_a=excluded.suff_a, suff_b=excluded.suff_b, "
+    "  best_sum=excluded.best_sum, best_a=excluded.best_a, best_b=excluded.best_b"
+)
+
+
+def _dd_save_seg(conn: sqlite3.Connection, node: int, s: _Seg) -> None:
+    """写入单个线段树节点记录（复杂度计数的基本写单位）。"""
+    def flat(c):
+        return (None, None, None) if c is None else (c[0], c[1], c[2])
+
+    ps, pa, pb = flat(s.pref)
+    ss, sa, sb = flat(s.suff)
+    bs, ba, bb = flat(s.best)
+    conn.execute(_DD_UPSERT_SQL, (
+        node, s.cnt, s.tot, ps, pa, pb, ss, sa, sb, bs, ba, bb
+    ))
+
+
+def _calendar_days_and_ords(conn: sqlite3.Connection) -> tuple[list[str], list[int]]:
+    days = [r["date"] for r in conn.execute("SELECT date FROM calendar ORDER BY date")]
+    rolls = conn.execute(
+        "SELECT ord, switch_date FROM rolls ORDER BY switch_date, ord"
+    ).fetchall()
+    ords: list[int] = []
+    k = 0
+    cur = 0
+    for d in days:
+        while k < len(rolls) and rolls[k]["switch_date"] <= d:
+            cur = rolls[k]["ord"]
+            k += 1
+        ords.append(cur)
+    return days, ords
+
+
+def _build_leaf_segs(conn: sqlite3.Connection) -> tuple[list[str], list[_Seg]]:
+    """按当前已提交的日历/计划/报价计算全部边叶（全量重建时使用，允许 O(n)）。"""
+    days, ords = _calendar_days_and_ords(conn)
+    contracts = {
+        r["ord"]: r["contract_id"]
+        for r in conn.execute("SELECT contract_id, ord FROM contracts")
+    }
+    prices = {
+        (r["contract_id"], r["date"]): r["price"]
+        for r in conn.execute("SELECT contract_id, date, price FROM prices")
+    }
+    segs: list[_Seg] = []
+    for li in range(len(days) - 1):
+        d_prev, d_next = days[li], days[li + 1]
+        cid = contracts.get(ords[li + 1])  # 后一日在用合约
+        if cid is None:
+            segs.append(_broken_leaf_seg())
+            continue
+        p_next = prices.get((cid, d_next))
+        p_prev = prices.get((cid, d_prev))
+        if p_next is None or p_prev is None:
+            segs.append(_broken_leaf_seg())
+        else:
+            segs.append(_leaf_seg(li, p_next - p_prev))
+    return days, segs
+
+
+def _rebuild_drawdown_index_locked(conn: sqlite3.Connection) -> dict:
+    """
+    全量重建 dd_day_idx / dd_node，并把 built_rev 对齐到当前 rev。
+    调用方必须已持有事务（write_tx 或 snapshot 内）。
+    """
+    days, leaves = _build_leaf_segs(conn)
+    n = len(days)
+    edge_count = n - 1 if n >= 2 else 0
+    size = 1
+    while size < max(edge_count, 1):
+        size <<= 1
+
+    conn.execute("DELETE FROM dd_node")
+    conn.execute("DELETE FROM dd_day_idx")
+    conn.executemany(
+        "INSERT INTO dd_day_idx(idx, date) VALUES (?, ?)",
+        list(enumerate(days)),
+    )
+
+    tree = [_Seg() for _ in range(2 * size)]
+    for li, seg in enumerate(leaves):
+        tree[size + li] = seg
+    for node in range(size - 1, 0, -1):
+        tree[node] = _merge_seg(tree[2 * node], tree[2 * node + 1])
+
+    rows = []
+    for node in range(1, 2 * size):
+        s = tree[node]
+
+        def flat(c):
+            return (None, None, None) if c is None else (c[0], c[1], c[2])
+
+        ps, pa, pb = flat(s.pref)
+        ss, sa, sb = flat(s.suff)
+        bs, ba, bb = flat(s.best)
+        rows.append((node, s.cnt, s.tot, ps, pa, pb, ss, sa, sb, bs, ba, bb))
+    conn.executemany(_DD_UPSERT_SQL, rows)
+
+    rev = conn.execute("SELECT rev FROM dd_state WHERE id = 1").fetchone()["rev"]
+    conn.execute(
+        "UPDATE dd_state SET built_rev = ?, n_days = ?, leaf_count = ?, size = ?, "
+        "built_at = ? WHERE id = 1",
+        (rev, n, edge_count, size, datetime.now().isoformat(timespec="seconds")),
+    )
+    return {"n_days": n, "leaf_count": edge_count, "size": size}
+
+
+def rebuild_drawdown_index(conn: sqlite3.Connection) -> dict:
+    """独立事务版本的全量重建（启动补建/运维入口）。"""
+    with write_tx(conn):
+        return _rebuild_drawdown_index_locked(conn)
+
+
+def ensure_drawdown_index(conn: sqlite3.Connection) -> bool:
+    """旧库首次补建 / 过期重建。返回是否发生了重建。"""
+    row = _dd_state_row(conn)
+    if row is None or row["built_rev"] != row["rev"]:
+        rebuild_drawdown_index(conn)
+        return True
+    return False
+
+
+def _compute_leaf_seg_by_idx(conn: sqlite3.Connection, li: int) -> _Seg:
+    """实时重算单条边 li（d_li -> d_li+1），供单笔报价后的增量维护。"""
+    row = conn.execute(
+        "SELECT d0.date AS d0, d1.date AS d1 "
+        "FROM dd_day_idx d0 JOIN dd_day_idx d1 ON d1.idx = d0.idx + 1 "
+        "WHERE d0.idx = ?",
+        (li,),
+    ).fetchone()
+    if row is None:
+        return _broken_leaf_seg()
+    ord_ = active_contract_ord(conn, row["d1"])
+    contract = contract_by_ord(conn, ord_)
+    if contract is None:
+        return _broken_leaf_seg()
+    p_prev = get_price(conn, contract["contract_id"], row["d0"])
+    p_next = get_price(conn, contract["contract_id"], row["d1"])
+    if p_prev is None or p_next is None:
+        return _broken_leaf_seg()
+    return _leaf_seg(li, p_next - p_prev)
+
+
+def _refresh_leaf_path_locked(conn: sqlite3.Connection, size: int, li: int) -> int:
+    """重算叶 li 并自底向上更新到根：写 O(log n) 节点、读 O(log n) 兄弟节点。"""
+    leaf_id = size + li
+    seg = _compute_leaf_seg_by_idx(conn, li)
+    _dd_save_seg(conn, leaf_id, seg)
+
+    child_id = leaf_id
+    child_seg = seg
+    while child_id > 1:
+        parent_id = child_id >> 1
+        if child_id & 1:  # 当前 child 是右孩子，左兄弟 = child_id - 1
+            sibling = _dd_load_seg(conn, child_id - 1)
+            merged = _merge_seg(sibling, child_seg)
+        else:             # 当前 child 是左孩子，右兄弟 = child_id + 1
+            sibling = _dd_load_seg(conn, child_id + 1)
+            merged = _merge_seg(child_seg, sibling)
+        _dd_save_seg(conn, parent_id, merged)
+        child_id, child_seg = parent_id, merged
+    return leaf_id
+
+
+def _sync_drawdown_after_price_write(
+    conn: sqlite3.Connection,
+    state_pre: Optional[sqlite3.Row],
+    contract_id: int,
+    day: str,
+) -> None:
+    """
+    报价写事务内的回落索引同步：
+      - 写前索引与 rev 对齐（受支持的正常路径）→ 至多刷新相邻两条边，O(log n)；
+      - 写前已过期（如旧库/库外改动）→ 全量重建兜底；
+    最后把 built_rev 对齐到本事务触发后的最新 rev。
+    """
+    fresh = state_pre is not None and state_pre["built_rev"] == state_pre["rev"]
+    if not fresh:
+        _rebuild_drawdown_index_locked(conn)
+        return
+
+    n_days = state_pre["n_days"]
+    size = state_pre["size"]
+    idx_row = conn.execute(
+        "SELECT idx FROM dd_day_idx WHERE date = ?", (day,)
+    ).fetchone()
+    if idx_row is not None and n_days >= 2:
+        di = idx_row["idx"]
+        # 该报价至多被“终于该日”和“起于该日”的两条边使用
+        for li in (di - 1, di):
+            if 0 <= li < n_days - 1:
+                _refresh_leaf_path_locked(conn, size, li)
+
+    conn.execute(
+        "UPDATE dd_state SET built_rev = "
+        "(SELECT rev FROM dd_state WHERE id = 1) WHERE id = 1"
+    )
+
+
+def delete_price(conn: sqlite3.Connection, contract_id: int, day: str) -> dict:
+    """删除一笔报价（演示回放/运维用），与 upsert 一样原子联动价差与回落索引。"""
+    try:
+        with write_tx(conn):
+            state_pre = _dd_state_row(conn)
+            affected_roll = conn.execute(
+                "SELECT ord FROM rolls WHERE pre_date = ?", (day,)
+            ).fetchone()
+            conn.execute(
+                "DELETE FROM prices WHERE contract_id = ? AND date = ?",
+                (contract_id, day),
+            )
+            new_delta = None
+            if affected_roll is not None:
+                new_delta = _recompute_roll_delta(conn, affected_roll["ord"])
+            _sync_drawdown_after_price_write(conn, state_pre, contract_id, day)
+        return {"committed": True, "new_delta": new_delta}
+    except sqlite3.Error as e:
+        return {"committed": False, "error": str(e)}
+
+
+def reset_all_data(conn: sqlite3.Connection) -> None:
+    """清空全部业务数据（网页演示场景载入前使用）。"""
+    with write_tx(conn):
+        # 先解除 meta 对 contracts 的外键引用，再按子表→父表顺序删除
+        conn.execute("UPDATE meta SET initial_contract_id = NULL WHERE id = 1")
+        for table in ("prices", "rolls", "contracts", "calendar",
+                      "bit_sums", "dd_node", "dd_day_idx"):
+            conn.execute(f"DELETE FROM {table}")
+        # 上面 DELETE 源表会经触发器推动 rev；这里把索引状态彻底归零
+        conn.execute(
+            "UPDATE dd_state SET rev = 0, built_rev = -1, n_days = 0, "
+            "leaf_count = 0, size = 1, built_at = NULL WHERE id = 1"
+        )
+
+
+def _dd_range_seg(conn: sqlite3.Connection, ql: int, qr: int,
+                  size: int) -> _Seg:
+    """
+    取叶下标半开区间 [ql, qr) 的合并摘要。
+    迭代式线段树标准区间分解，选中节点 ≤ 2 log2(size)，逐节点主键读取。
+    """
+    left_acc = _Seg()
+    right_acc = _Seg()
+    l = ql + size
+    r = qr + size
+    while l < r:
+        if l & 1:
+            left_acc = _merge_seg(left_acc, _dd_load_seg(conn, l))
+            l += 1
+        if r & 1:
+            r -= 1
+            right_acc = _merge_seg(_dd_load_seg(conn, r), right_acc)
+        l >>= 1
+        r >>= 1
+    return _merge_seg(left_acc, right_acc)
+
+
+def _date_by_idx(conn: sqlite3.Connection, idx: int) -> Optional[str]:
+    row = conn.execute("SELECT date FROM dd_day_idx WHERE idx = ?", (idx,)).fetchone()
+    return row["date"] if row else None
+
+
+def _edge_details_locked(conn: sqlite3.Connection, start: str, end: str,
+                         best: Optional[dict]) -> list[dict]:
+    """
+    生成逐日边权核对明细（供网页展示，会按区间逐日取价，属展示开销，
+    不参与最大回落的对数级索引核算）。
+    """
+    days = [r["date"] for r in conn.execute(
+        "SELECT date FROM calendar WHERE date BETWEEN ? AND ? ORDER BY date",
+        (start, end),
+    )]
+    roll_dates = {r["switch_date"] for r in conn.execute("SELECT switch_date FROM rolls")}
+    edges: list[dict] = []
+    for d_prev, d_next in zip(days, days[1:]):
+        ord_ = active_contract_ord(conn, d_next)
+        contract = contract_by_ord(conn, ord_)
+        code = contract["code"] if contract else "（无合约）"
+        cid = contract["contract_id"] if contract else None
+        p_prev = get_price(conn, cid, d_prev) if cid is not None else None
+        p_next = get_price(conn, cid, d_next) if cid is not None else None
+        valid = p_prev is not None and p_next is not None
+        missing = []
+        if cid is None:
+            missing.append("该日尚未登记在用合约/换月计划")
+        else:
+            if p_prev is None:
+                missing.append(f"{code} 在 {d_prev} 的报价")
+            if p_next is None:
+                missing.append(f"{code} 在 {d_next} 的报价")
+        in_best = False
+        if best and best.get("found"):
+            in_best = d_prev >= best["start"] and d_next <= best["end"]
+        edges.append({
+            "prev_date": d_prev,
+            "next_date": d_next,
+            "contract": code,
+            "prev_price": p_prev,
+            "next_price": p_next,
+            "change": (p_next - p_prev) if valid else None,
+            "valid": valid,
+            "missing": "、".join(missing),
+            "is_roll_edge": d_next in roll_dates,
+            "in_best": in_best,
+        })
+    return edges
+
+
+def find_max_drawdown(conn: sqlite3.Connection, start: str, end: str,
+                      details: bool = False) -> dict:
+    """
+    在 [start, end] 交易日窗口内，找累计下跌最多的两日 (a, b)。
+
+    返回 dict：
+      found=True  → start/end（日期）、amount（正整数分）、sum（负的累计和）
+      found=False → reason ∈ {bad_window, no_trade_days, need_two_days, no_decline}
+    整个核算在同一个只读快照事务内完成；索引过期时在该事务内幂等补建并随提交发布。
+    details=True 时额外在同一快照内生成逐日核对明细 edges。
+    """
+    for label, v in (("开始日", start), ("结束日", end)):
+        if not valid_iso(v):
+            raise AppError(f"{label}格式非法：{v}，应为 YYYY-MM-DD")
+    if start > end:
+        raise AppError("开始日不能晚于结束日")
+
+    result: dict = {
+        "found": False, "start": start, "end": end,
+        "amount": None, "sum": None, "reason": None, "message": "",
+        "window_days": 0, "edges": None,
+    }
+
+    with snapshot(conn):
+        st = _dd_state_row(conn)
+        if st is None or st["built_rev"] != st["rev"]:
+            # 旧库首次补建，或检测到库外直接改源表后的重建；同一事务同一快照
+            st_info = _rebuild_drawdown_index_locked(conn)
+            size = st_info["size"]
+        else:
+            size = st["size"]
+
+        lo = conn.execute(
+            "SELECT idx, date FROM dd_day_idx WHERE date >= ? "
+            "ORDER BY date ASC LIMIT 1",
+            (start,),
+        ).fetchone()
+        hi = conn.execute(
+            "SELECT idx, date FROM dd_day_idx WHERE date <= ? "
+            "ORDER BY date DESC LIMIT 1",
+            (end,),
+        ).fetchone()
+
+        if lo is None or hi is None or lo["idx"] > hi["idx"]:
+            result["reason"] = "no_trade_days"
+            result["message"] = f"{start} 至 {end} 之间没有交易日，无法核实回落"
+            if details:
+                result["edges"] = []
+            return result
+
+        i0, i1 = lo["idx"], hi["idx"]
+        result["window_days"] = i1 - i0 + 1
+        if i1 - i0 < 1:
+            result["reason"] = "need_two_days"
+            result["message"] = "所选区间只有一个交易日，至少需要相邻两个交易日才能计算回落"
+            if details:
+                result["edges"] = []
+            return result
+
+        # 日下标 [i0, i1] → 叶下标半开区间 [i0, i1)（叶 li 连接日 li 与 li+1）
+        seg = _dd_range_seg(conn, i0, i1, size)
+        cand = seg.best
+
+        if cand is None or cand[0] >= 0:
+            result["reason"] = "no_decline"
+            result["message"] = (
+                "所选区间内没有可核实的累计下跌：所有未被断点分开的两日累计涨跌均未下跌"
+                if cand is not None else
+                "所选区间内没有可核实的下跌：相邻交易日之间的必需报价均不完整（全是断点）"
+            )
+            if details:
+                result["edges"] = _edge_details_locked(conn, start, end, result)
+            return result
+
+        total, a, b = cand
+        result.update({
+            "found": True,
+            "sum": total,
+            "amount": -total,           # 回落金额，正整数分
+            "start_idx": a,
+            "end_idx": b,
+            "start": _date_by_idx(conn, a),
+            "end": _date_by_idx(conn, b),
+        })
+        result["message"] = (
+            f"最大回落 {result['amount']} 分："
+            f"{result['start']} → {result['end']} 累计涨跌 {total} 分"
+        )
+        if details:
+            result["edges"] = _edge_details_locked(conn, start, end, result)
+        return result
+
+
+# 便于不同调用习惯/潜在外部脚本按名取用
+query_drawdown = find_max_drawdown
+max_drawdown = find_max_drawdown
 
 
 # --------------------------------------------------------------------------- #

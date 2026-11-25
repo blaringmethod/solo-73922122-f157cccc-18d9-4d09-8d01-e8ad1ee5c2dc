@@ -15,6 +15,7 @@
     <a href="{{ url_for('plan_view') }}">换月计划</a>
     <a href="{{ url_for('prices_view') }}">报价补录/更正</a>
     <a href="{{ url_for('query_view') }}">连续价取数</a>
+    <a href="{{ url_for('query_view', _anchor='drawdown') }}">区间回落</a>
   </nav>
 </header>
 <main>
@@ -29,6 +30,6 @@
   {% endwith %}
   {% block content %}{% endblock %}
 </main>
-<footer>连续价实时计算，不落库；基准日不早于查询结束日 · 价格单位：分（整数）</footer>
+<footer>连续价实时计算、不落库；区间回落由可全量重建的线段树索引核算 · 一次查询同一已提交快照 · 价格单位：分（整数）</footer>
 </body>
 </html>

@@ -120,6 +120,48 @@ def main():
     st, html = get("/query?start=2026-01-05&end=2026-01-13&base=2026-01-08")
     checks.append(("拒绝基准日早于结束日", st == 200 and "不能早于结束日" in html))
 
+    # 9) 区间回落：本数据集逐日边权全部为正（含换月边），应提示无可核实下跌
+    st, payload = get("/api/drawdown?start=2026-01-05&end=2026-01-13")
+    import json
+    dd = json.loads(payload)
+    checks.append(("回落 JSON 200 且无下跌",
+                   st == 200 and dd["ok"] and dd["found"] is False))
+    st, html = get("/query?dd_start=2026-01-05&dd_end=2026-01-13")
+    checks.append(("回落页提示无可核实下跌", "没有可核实的累计下跌" in html))
+
+    # 10) 网页演示：一键载入（补价前 200）→ 补价后 690
+    st, _ = post("/demo/seed", {})
+    checks.append(("载入演示场景 302", st == 302))
+    st, html = get("/query?dd_start=2026-03-02&dd_end=2026-03-11&demo=before")
+    checks.append(("补价前最大回落 200",
+                   st == 200 and 'dd-num">200<' in html
+                   and "2026-03-04" in html and "2026-03-05" in html))
+    checks.append(("演示换月边可核算且标注", "换月边" in html and "断点" in html))
+    st, payload = get("/api/drawdown?start=2026-03-02&end=2026-03-11")
+    dd = json.loads(payload)
+    checks.append(("补价前 JSON=200",
+                   dd["found"] and dd["amount"] == 200
+                   and dd["start"] == "2026-03-04"
+                   and dd["end"] == "2026-03-05"))
+
+    st, _ = post("/demo/fill", {})
+    checks.append(("一键补价 302", st == 302))
+    st, payload = get("/api/drawdown?start=2026-03-02&end=2026-03-11")
+    dd = json.loads(payload)
+    checks.append(("补价后 JSON=690",
+                   dd["found"] and dd["amount"] == 690
+                   and dd["start"] == "2026-03-04"
+                   and dd["end"] == "2026-03-11"))
+    st, html = get("/query?dd_start=2026-03-02&dd_end=2026-03-11&demo=after")
+    checks.append(("补价后页面显示 690", 'dd-num">690<' in html))
+
+    # 重复载入演示（重置已有数据）也必须成功（外键删除顺序回归）
+    st, _ = post("/demo/seed", {})
+    checks.append(("可重复载入演示", st == 302))
+    st, payload = get("/api/drawdown?start=2026-03-02&end=2026-03-11")
+    dd = json.loads(payload)
+    checks.append(("重置后回到补价前 200", dd["found"] and dd["amount"] == 200))
+
     print("\n===== 端到端试跑结果 =====")
     ok = True
     for name, passed in checks:

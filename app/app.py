@@ -6,20 +6,23 @@ import io
 import os
 
 from flask import (
-    Flask, Response, flash, g, redirect, render_template, request, url_for,
+    Flask, Response, flash, g, jsonify, redirect, render_template,
+    request, url_for,
 )
 
-from . import db
+from . import db, demo
 
 
 def create_app() -> Flask:
     app = Flask(__name__)
     app.config["SECRET_KEY"] = os.environ.get("CONT_SECRET_KEY", "dev-secret-change-me")
 
-    # 启动即建表（IF NOT EXISTS，幂等），保证容器起来即可用
+    # 启动即建表（IF NOT EXISTS，幂等），保证容器起来即可用；
+    # 同时为旧库首次补建回落线段树索引（新库为空索引，开销常数级）
     boot = db.connect()
     try:
         db.init_db(boot)
+        db.ensure_drawdown_index(boot)
     finally:
         boot.close()
 
@@ -130,7 +133,7 @@ def create_app() -> Flask:
         )
 
     # ------------------------------------------------------------------ #
-    # 取数：连续价查询 + CSV 下载
+    # 取数：连续价查询 + CSV 下载 + 区间最大回落
     # ------------------------------------------------------------------ #
     @app.route("/query", methods=["GET"])
     def query_view():
@@ -145,9 +148,126 @@ def create_app() -> Flask:
                 rows = db.fetch_range(conn, start, end, base)
             except db.AppError as e:
                 err = str(e)
+
+        # 区间回落：优先用回落表单自己的起止日；否则复用连续价表单的起止日
+        raw_dd_start = request.args.get("dd_start", "").strip()
+        raw_dd_end = request.args.get("dd_end", "").strip()
+        if raw_dd_start or raw_dd_end:
+            dd_start, dd_end = raw_dd_start, raw_dd_end
+            dd_submitted = True
+        elif start and end:
+            dd_start, dd_end = start, end
+            dd_submitted = True
+        else:
+            dd_start = dd_end = ""
+            dd_submitted = False
+        dd = None
+        dd_err = None
+        if dd_submitted:
+            try:
+                dd = db.find_max_drawdown(conn, dd_start, dd_end, details=True)
+            except db.AppError as e:
+                dd_err = str(e)
+
+        demo_mode = request.args.get("demo", "").strip()
         return render_template(
-            "query.html", start=start, end=end, base=base, rows=rows, err=err
+            "query.html",
+            start=start, end=end, base=base, rows=rows, err=err,
+            dd_start=dd_start, dd_end=dd_end, dd=dd, dd_err=dd_err,
+            dd_submitted=dd_submitted, demo_mode=demo_mode,
+            demo_const=demo,
         )
+
+    @app.route("/drawdown")
+    def drawdown_alias():
+        """便于直接访问/外部探活的别名：落到连续价页的回落区间。"""
+        dd_start = request.args.get("dd_start") or request.args.get("start", "")
+        dd_end = request.args.get("dd_end") or request.args.get("end", "")
+        return redirect(url_for(
+            "query_view", dd_start=dd_start, dd_end=dd_end, _anchor="drawdown"
+        ))
+
+    @app.route("/api/drawdown")
+    def api_drawdown():
+        """机器可读的最大回落 JSON；同一快照读取，核算只触 O(log n) 索引记录。"""
+        conn = get_conn()
+        start = (request.args.get("start")
+                 or request.args.get("dd_start") or "").strip()
+        end = (request.args.get("end")
+               or request.args.get("dd_end") or "").strip()
+        try:
+            result = db.find_max_drawdown(conn, start, end, details=False)
+        except db.AppError as e:
+            return jsonify({"ok": False, "error": str(e)}), 400
+        return jsonify({"ok": True, **result})
+
+    # ------------------------------------------------------------------ #
+    # 网页演示：换月 + 补价前后的回落
+    # ------------------------------------------------------------------ #
+    @app.post("/demo/seed")
+    def demo_seed():
+        conn = get_conn()
+        try:
+            before = demo.seed_before(conn)
+            if before.get("found"):
+                flash(
+                    f"演示场景已载入（补价前）：一次换月 {demo.ROLL_DATE} "
+                    f"{demo.INITIAL_CODE} → {demo.NEW_CODE}，且旧合约在换月参考日 "
+                    f"2026-03-04 缺价。当前最大回落 {before['amount']} 分"
+                    f"（{before['start']} → {before['end']}，正是换月边）。"
+                    f"再点「补入关键报价」看变化。",
+                    "ok",
+                )
+            else:
+                flash("演示场景已载入（补价前）。", "ok")
+        except Exception as e:  # 演示按钮不应抛出裸 500
+            app.logger.exception("demo seed failed")
+            flash(f"演示场景载入失败：{e}", "err")
+        return redirect(url_for(
+            "query_view",
+            dd_start=demo.DEMO_START, dd_end=demo.DEMO_END,
+            demo="before", _anchor="drawdown",
+        ))
+
+    @app.post("/demo/fill")
+    def demo_fill():
+        conn = get_conn()
+        try:
+            before, after = demo.fill_key_quote(conn)
+            if before.get("found") and after.get("found"):
+                flash(
+                    f"补价已保存并与换月价差、回落索引在同一事务生效。"
+                    f"补价前最大回落 {before['amount']} 分"
+                    f"（{before['start']} → {before['end']}）；"
+                    f"补价后最大回落 {after['amount']} 分"
+                    f"（{after['start']} → {after['end']}）。",
+                    "ok",
+                )
+            else:
+                flash("补价已保存。", "ok")
+        except Exception as e:
+            app.logger.exception("demo fill failed")
+            flash(f"补价失败已回滚，照旧供数：{e}", "err")
+        return redirect(url_for(
+            "query_view",
+            dd_start=demo.DEMO_START, dd_end=demo.DEMO_END,
+            demo="after", _anchor="drawdown",
+        ))
+
+    @app.post("/demo/unfill")
+    def demo_unfill():
+        conn = get_conn()
+        try:
+            demo.unfill_key_quote(conn)
+            flash("已删除关键报价，回到补价前状态，可重新演示补价过程。", "ok")
+        except Exception as e:
+            app.logger.exception("demo unfill failed")
+            flash(f"删除失败：{e}", "err")
+        return redirect(url_for(
+            "query_view",
+            dd_start=demo.DEMO_START, dd_end=demo.DEMO_END,
+            demo="before", _anchor="drawdown",
+        ))
 
     @app.route("/download")
     def download():
